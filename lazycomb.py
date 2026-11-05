@@ -25,9 +25,21 @@ def _size(pool) -> int:
     return len(pool)
 
 
-def _pool(pool):
-    """Keep sequences as they are (they are indexable); materialize plain iterators, like itertools does."""
-    return pool if isinstance(pool, (Lazy, range, list, tuple, str, bytes)) else tuple(pool)
+def _one_shot(pool) -> bool:
+    try:
+        return iter(pool) is pool
+    except TypeError:
+        raise TypeError(f"{type(pool).__name__!r} object is not iterable") from None
+
+
+def _pool(pool, once: bool = False):
+    """Pools are never copied. A one-shot iterator (a generator, `iter(...)`) can only be read once, so it is only
+    accepted where it is (the first pool of a Product); anywhere else, pass something re-iterable: a range, list,
+    lazy sequence, or any object whose __iter__ returns a fresh iterator."""
+    if not once and _one_shot(pool):
+        raise TypeError("this pool is a one-shot iterator and would have to be read more than once; "
+                        "pass a re-iterable (range, list, lazy sequence, ...) instead")
+    return pool
 
 
 def _index(pool, x) -> int:
@@ -91,11 +103,21 @@ class Product(Lazy):
     """itertools.product: mixed radix, the last pool changes fastest. Iteration is an odometer."""
 
     def __init__(self, *pools, repeat: int = 1):
-        self.pools = [_pool(p) for p in pools] * repeat
-        self.sizes = [_size(p) for p in self.pools]
-        self.size = 1
+        pools = list(pools) * repeat
+        if repeat > 1 and pools and _one_shot(pools[0]):
+            raise TypeError("repeat > 1 reads the first pool more than once: pass a re-iterable")
+        self.pools = [_pool(p, once=(i == 0)) for i, p in enumerate(pools)]
+
+    @property
+    def sizes(self):
+        return [_size(p) for p in self.pools]
+
+    @property
+    def size(self):
+        n = 1
         for s in self.sizes:
-            self.size *= s
+            n *= s
+        return n
 
     def _get(self, i):
         out = []
@@ -113,21 +135,33 @@ class Product(Lazy):
         return i
 
     def __iter__(self):
-        if self.size == 0:
+        """An odometer of live iterators, one per pool: when the last one runs out it is restarted and the one
+        before it advances. Nothing is indexed, sized or copied, so pools can be any re-iterables, of any size."""
+        n = len(self.pools)
+        if n == 0:
+            yield ()
             return
-        digits = [0] * len(self.pools)
-        current = [pool[0] for pool in self.pools]
+        its, current = [], []
+        for pool in self.pools:
+            it = iter(pool)
+            try:
+                current.append(next(it))
+            except StopIteration:
+                return
+            its.append(it)
         while True:
             yield tuple(current)
-            k = len(digits) - 1
-            while k >= 0 and digits[k] + 1 == self.sizes[k]:
-                digits[k] = 0
-                current[k] = self.pools[k][0]
-                k -= 1
-            if k < 0:
-                return
-            digits[k] += 1
-            current[k] = self.pools[k][digits[k]]
+            k = n - 1
+            while True:
+                try:
+                    current[k] = next(its[k])
+                    break
+                except StopIteration:
+                    if k == 0:
+                        return
+                    its[k] = iter(self.pools[k])  # restart this wheel ...
+                    current[k] = next(its[k])
+                    k -= 1  # ... and advance the previous one
 
     def __repr__(self):
         return f"Product({', '.join(map(repr, self.pools))})"
@@ -178,6 +212,34 @@ class Permutations(Lazy):
             i += j * perm(self.n - k - 1, self.r - k - 1)
             used.insert(_bisect(used, v), v)
         return i
+
+    def __iter__(self):
+        """Next r-permutation of indices in lexicographic order: O(r) per step, only r indices held."""
+        n, r = self.n, self.r
+        if not 0 <= r <= n:
+            return
+        idx = list(range(r))
+        while True:
+            yield tuple(self.pool[i] for i in idx)
+            used = set(idx)
+            for k in range(r - 1, -1, -1):
+                used.discard(idx[k])
+                nxt = idx[k] + 1
+                while nxt in used:
+                    nxt += 1
+                if nxt < n:
+                    idx[k] = nxt
+                    used.add(nxt)
+                    fill, v = k + 1, 0
+                    while fill < r:  # smallest unused indices, in order
+                        while v in used:
+                            v += 1
+                        idx[fill] = v
+                        used.add(v)
+                        fill += 1
+                    break
+            else:
+                return
 
     def __repr__(self):
         return f"Permutations({self.pool!r}, {self.r})"
@@ -241,6 +303,24 @@ class Combinations(Lazy):
             raise ValueError("not a combination in pool order")
         return self._rank(idx)
 
+    def __iter__(self):
+        """itertools' index algorithm: O(1) amortized per step, only r indices held."""
+        n, r = self.n, self.r
+        if not 0 <= r <= n:
+            return
+        idx = list(range(r))
+        yield tuple(self.pool[i] for i in idx)
+        while True:
+            for k in range(r - 1, -1, -1):
+                if idx[k] != k + n - r:
+                    break
+            else:
+                return
+            idx[k] += 1
+            for j in range(k + 1, r):
+                idx[j] = idx[j - 1] + 1
+            yield tuple(self.pool[i] for i in idx)
+
     def __repr__(self):
         return f"Combinations({self.pool!r}, {self.r})"
 
@@ -271,6 +351,23 @@ class CombinationsWithReplacement(Lazy):
             return 0
         return self._plain._rank([v + k for k, v in enumerate(idx)])
 
+    def __iter__(self):
+        n, r = self.n, self.r
+        if n == 0:
+            if r == 0:
+                yield ()
+            return
+        idx = [0] * r
+        yield tuple(self.pool[i] for i in idx)
+        while True:
+            for k in range(r - 1, -1, -1):
+                if idx[k] != n - 1:
+                    break
+            else:
+                return
+            idx[k:] = [idx[k] + 1] * (r - k)
+            yield tuple(self.pool[i] for i in idx)
+
     def __repr__(self):
         return f"CombinationsWithReplacement({self.pool!r}, {self.r})"
 
@@ -279,11 +376,18 @@ class Map(Lazy):
     """f applied to each element; `inverse` (optional) makes `.index` work."""
 
     def __init__(self, f, pool, inverse=None):
-        self.f, self.pool, self.inverse = f, _pool(pool), inverse
-        self.size = _size(self.pool)
+        self.f, self.pool, self.inverse = f, _pool(pool, once=True), inverse
+
+    @property
+    def size(self):
+        return _size(self.pool)
 
     def _get(self, i):
         return self.f(self.pool[i])
+
+    def __iter__(self):
+        for v in self.pool:
+            yield self.f(v)
 
     def index(self, x):
         if self.inverse is None:
@@ -292,18 +396,28 @@ class Map(Lazy):
 
 
 class Chain(Lazy):
-    """itertools.chain over sequences."""
+    """itertools.chain over sequences (iterating also works over one-shot iterators, each read once)."""
 
     def __init__(self, *pools):
-        self.pools = [_pool(p) for p in pools]
-        self.sizes = [_size(p) for p in self.pools]
-        self.size = sum(self.sizes)
+        self.pools = [_pool(p, once=True) for p in pools]
+
+    @property
+    def sizes(self):
+        return [_size(p) for p in self.pools]
+
+    @property
+    def size(self):
+        return sum(self.sizes)
 
     def _get(self, i):
         for pool, s in zip(self.pools, self.sizes):
             if i < s:
                 return pool[i]
             i -= s
+
+    def __iter__(self):
+        for pool in self.pools:
+            yield from pool
 
     def index(self, x):
         offset = 0
