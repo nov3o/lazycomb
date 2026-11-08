@@ -442,3 +442,178 @@ class Slice(Lazy):
 
     def index(self, x):
         return _index(self.range, self.seq.index(x))
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Search: a pattern (one entry per position) selects the matching elements as another lazy sequence, in the parent's
+# order, without scanning. `ANY` matches anything; a value matches itself; for Product, a set or list matches any of
+# its values. Matches has `.size` (how many), `[i]`, `.index(x)`, iteration, and `.position(i)`: where the i-th match
+# sits in the parent sequence.
+# ---------------------------------------------------------------------------------------------------------------------
+
+class _Any:
+    def __repr__(self):
+        return "ANY"
+
+
+ANY = _Any()
+
+
+class Without(Lazy):
+    """range(n) without the sorted indices `skip`: the free indices left once some are fixed."""
+
+    def __init__(self, n: int, skip):
+        self.n, self.skip = n, sorted(skip)
+        self.size = n - len(self.skip)
+
+    def _get(self, i):
+        return _nth_unused(i, self.skip)
+
+    def index(self, v):
+        if not 0 <= v < self.n or (self.skip and self.skip[min(_bisect(self.skip, v), len(self.skip) - 1)] == v):
+            raise ValueError(f"{v!r} is not free")
+        return v - _bisect(self.skip, v)
+
+
+class Matches(Lazy):
+    """The elements of `parent` matching a pattern. `inner` is a lazy sequence of index tuples (pool indices, one per
+    position) in the parent's order; `assemble` turns one into an element, `split` an element back into one."""
+
+    def __init__(self, parent, inner, assemble, split):
+        self.parent, self.inner, self.assemble, self.split = parent, inner, assemble, split
+        self.size = inner.size
+
+    def _get(self, i):
+        return self.assemble(self.inner._get(i))
+
+    def __iter__(self):
+        for t in self.inner:
+            yield self.assemble(t)
+
+    def index(self, x):
+        return self.inner.index(self.split(x))
+
+    def position(self, i):
+        """Index in the parent of the i-th match."""
+        return self.parent.index(self[i])
+
+    def __repr__(self):
+        return f"Matches({self.size} in {self.parent!r})"
+
+
+def _check_len(pattern, r):
+    if len(pattern) != r:
+        raise ValueError(f"pattern has {len(pattern)} positions, expected {r}")
+
+
+def _product_search(self, *pattern):
+    _check_len(pattern, len(self.pools))
+    choices = []
+    for pool, p in zip(self.pools, pattern):
+        if p is ANY:
+            choices.append(range(_size(pool)))
+        elif isinstance(p, (set, frozenset, list)):
+            choices.append(sorted({_index(pool, v) for v in p if v in pool}))
+        else:
+            choices.append([_index(pool, p)] if p in pool else [])
+    inner = Product(*choices)
+    pools = self.pools
+    return Matches(self, inner, lambda t: tuple(pool[j] for pool, j in zip(pools, t)),
+                   lambda x: tuple(_index(pool, v) for pool, v in zip(pools, x)))
+
+
+def _fixed(self, pattern):
+    """Pool indices of the fixed positions, or None if a fixed value isn't in the pool."""
+    fixed = {}
+    for k, p in enumerate(pattern):
+        if p is ANY:
+            continue
+        if isinstance(p, (set, frozenset, list)):
+            raise TypeError("sets of values are only supported for Product; search each value separately")
+        if p not in self.pool:
+            return None
+        fixed[k] = _index(self.pool, p)
+    return fixed
+
+
+def _empty_matches(self):
+    return Matches(self, Product(range(0)), lambda t: t, lambda x: x)
+
+
+def _permutations_search(self, *pattern):
+    """Fixed positions take their values; the free positions are a permutation of the unused indices, and the
+    parent's lexicographic order restricted to the matches is exactly that permutation order."""
+    _check_len(pattern, self.r)
+    fixed = _fixed(self, pattern)
+    if fixed is None or len(set(fixed.values())) != len(fixed):
+        return _empty_matches(self)
+    free = [k for k in range(self.r) if k not in fixed]
+    rest = Without(self.n, fixed.values())
+    inner = Permutations(rest, len(free))
+    pool, r = self.pool, self.r
+
+    def assemble(t):
+        idx = [0] * r
+        for k, v in fixed.items():
+            idx[k] = v
+        for k, v in zip(free, t):
+            idx[k] = v
+        return tuple(pool[v] for v in idx)
+
+    return Matches(self, inner, assemble, lambda x: tuple(_index(pool, x[k]) for k in free))
+
+
+def _combinations_search(self, *pattern, replacement=False):
+    """Fixed values split the free positions into runs; a run between fixed indices a < b is a combination of the
+    indices strictly between them (with replacement: between them inclusive), and the runs combine as a product in
+    the parent's order."""
+    _check_len(pattern, self.r)
+    fixed = _fixed(self, pattern)
+    if fixed is None:
+        return _empty_matches(self)
+    ks = sorted(fixed)
+    vals = [fixed[k] for k in ks]
+    if any((a > b) if replacement else (a >= b) for a, b in zip(vals, vals[1:])):
+        return _empty_matches(self)
+    bounds = [(-1, -1)] + [(k, v) for k, v in zip(ks, vals)] + [(self.r, self.n)]
+    runs, segs = [], []
+    for (k0, v0), (k1, v1) in zip(bounds, bounds[1:]):
+        m = k1 - k0 - 1
+        if m == 0:
+            continue
+        lo = (v0 if replacement and k0 >= 0 else v0 + 1)
+        hi = (v1 + 1 if replacement and k1 < self.r else v1)
+        seg = range(max(lo, 0), hi)
+        segs.append(list(range(k0 + 1, k1)))
+        runs.append(CombinationsWithReplacement(seg, m) if replacement else Combinations(seg, m))
+    inner = Product(*runs)
+    pool, r = self.pool, self.r
+
+    def assemble(t):
+        idx = [0] * r
+        for k, v in fixed.items():
+            idx[k] = v
+        for positions, run in zip(segs, t):
+            for k, v in zip(positions, run):
+                idx[k] = v
+        return tuple(pool[v] for v in idx)
+
+    def split(x):
+        return tuple(tuple(_index(pool, x[k]) for k in positions) for positions in segs)
+
+    return Matches(self, inner, assemble, split)
+
+
+Product.search = _product_search
+Permutations.search = _permutations_search
+Combinations.search = _combinations_search
+CombinationsWithReplacement.search = lambda self, *p: _combinations_search(self, *p, replacement=True)
+
+
+def find(seq, pred, start: int = 0):
+    """Index of the first element at or after `start` with pred(element) true, or -1. This one does scan: use
+    `.search` when the condition is a pattern."""
+    for i in range(start, seq.size):
+        if pred(seq._get(i)):
+            return i
+    return -1
