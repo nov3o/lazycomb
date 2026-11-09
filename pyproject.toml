@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "itertools' product, permutations and combinations as lazy sequences you can index, rank and search"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
 
 [tool.setuptools]
 py-modules = ["lazycomb"]

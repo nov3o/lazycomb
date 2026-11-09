@@ -81,3 +81,7 @@ Indexing (`[i]`, µs per call): product of 10^100 elements: Python 89, Rust 7; p
 ```bash
 python3 test_lazycomb.py && python3 test_iter.py && python3 test_search.py
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
