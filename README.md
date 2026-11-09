@@ -1,6 +1,10 @@
 # lazycomb
 
-itertools' `product`, `permutations`, `combinations` and `combinations_with_replacement`, as lazy sequences: same names, same arguments, same order, but you can also index them, find an element's position, slice, and search, without generating anything.
+itertools' `product`, `permutations`, `combinations` and `combinations_with_replacement`, without evaluating their inputs.
+
+itertools copies every input into a tuple before producing the first element, so nested or large inputs blow up memory: `itertools.product(itertools.product(range(10), repeat=8), repeat=2)` builds all 10^8 inner tuples first. lazycomb keeps references to its inputs and walks them through indices, so nothing is evaluated except the elements you take, at any size and any depth of nesting. Same names, arguments and order as itertools.
+
+Because every object knows its inputs' sizes, you also get, as a by-product, `.size`, element number i (`seq[i]`), the position of an element (`seq.index(x)`), slicing and pattern search, all without generating anything. The cost is speed: iterating is slower than itertools, which is C (see below).
 
 ```python
 from lazycomb import product, permutations, combinations, ANY
