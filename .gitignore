@@ -1,0 +1,4 @@
+venv/
+rs/target/
+__pycache__/
+*.so

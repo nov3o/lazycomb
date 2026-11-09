@@ -617,3 +617,28 @@ def find(seq, pred, start: int = 0):
         if pred(seq._get(i)):
             return i
     return -1
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# itertools-compatible names and signatures. A one-shot iterator (generator, iter(...)) is copied into a tuple first,
+# as itertools does; anything re-iterable (range, list, lazy sequence) is used as is, never copied.
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _seq(it):
+    return tuple(it) if _one_shot(it) else it
+
+
+def product(*iterables, repeat: int = 1) -> Product:
+    return Product(*map(_seq, iterables), repeat=repeat)
+
+
+def permutations(iterable, r: int | None = None) -> Permutations:
+    return Permutations(_seq(iterable), r)
+
+
+def combinations(iterable, r: int) -> Combinations:
+    return Combinations(_seq(iterable), r)
+
+
+def combinations_with_replacement(iterable, r: int) -> CombinationsWithReplacement:
+    return CombinationsWithReplacement(_seq(iterable), r)
